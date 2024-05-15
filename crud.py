@@ -8,7 +8,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
 from core.db import get_db_session, Session
 from core.security import get_current_user, SECRET_KEY, ALGORITHMS, Token
-from random import generate_number
+from random_number import generate_number
 from timing import update_status
 from models import *
 
@@ -302,7 +302,10 @@ async def create_adviser(
     adviser: Adviser_FormCreate,
     db_session: Session = Depends(get_db_session)
     ):
-    adviser_entity = Adviser_FormEntity(phone_number = adviser.phone_number, password = adviser.password)
+    adviser_entity = Adviser_FormEntity(
+        phone_number = adviser.phone_number, 
+        password = adviser.password
+        )
     db_session.add(adviser_entity)
     db_session.commit()
     return adviser_entity

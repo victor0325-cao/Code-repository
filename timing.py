@@ -17,5 +17,5 @@ async def update_status(order_time):
                 db_session.commit()
 #                if order.status == "Expired":
 #                    order.status = "TimeOut"
-        except Exception as e:
-            print(f"An exception occurred in update_status: {e}")
+    except Exception as e:
+        print(f"An exception occurred in update_status: {e}")
