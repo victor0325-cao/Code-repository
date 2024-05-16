@@ -3,10 +3,11 @@ from sqlalchemy import select
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.sql.expression import asc
 from jose import jwt
-import redis
+from typing import List
+import redis, asyncio
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
-from core.db import get_db_session, Session
+from core.db import SessionDep
 from core.security import get_current_user, SECRET_KEY, ALGORITHMS, Token
 from random_number import generate_number
 from timing import update_status
@@ -15,22 +16,23 @@ from models import *
 
 router = APIRouter()
 
+
 #用户注册
 @router.post("/user/logon/",tags=["User"],response_model=User_FormOut)
 async def create_user(
     user:User_FormCreate,
-    db_session: Session = Depends(get_db_session)
+    session: SessionDep
     ):
     user_entity = User_FormEntity(phone_number = user.phone_number, password = user.password)
-    db_session.add(user_entity)
-    db_session.commit()
+    session.add(user_entity)
+    session.commit()
     return user_entity
 
 @router.post("/user/login_token/",tags=["User"])
 async def login(login_form: OAuth2PasswordRequestForm = Depends()):
-    db_session = Session()
+    session = Session()
     try:
-        user = db_session.query(User_FormEntity).filter(User_FormEntity.phone_number == login_form.username).first()
+        user = session.query(User_FormEntity).filter(User_FormEntity.phone_number == login_form.username).first()
         if not user or user.password != login_form.password:
             raise HTTPException(status_code = 401,
                 detail = "Incorrect phone_number or password",
@@ -44,18 +46,17 @@ async def login(login_form: OAuth2PasswordRequestForm = Depends()):
         token = jwt.encode(token_data, SECRET_KEY, ALGORITHMS)
         return Token(access_token = token, token_type = "bearer")
     finally:
-        db_session.close()
+        session.close()
 
 #修改信息
 @router.put("/user/info/",tags=["User"],response_model=UserOut)
 async def update_user(
-    user_id: int,  
+    user_id: int,   
     user: UserBase,
-    db_session: Session = Depends(get_db_session),
+    session: SessionDep,
     phone_number: str = Depends(get_current_user)
     ):
-    user_entity = db_session.query(UserEntity).filter(UserEntity.id == user_id).first()
-
+    user_entity = session.query(UserEntity).filter(UserEntity.id == user_id).first()
     if user_entity:
         user_entity.name = user.name
         user_entity.birth = user.birth
@@ -63,49 +64,37 @@ async def update_user(
         user_entity.bio = user.bio
         user_entity.about = user.about
         user_entity.coin = user.coin
-
         try:
-            db_session.commit()
-            db_session.refresh(user_entity)
+            session.commit()
+            session.refresh(user_entity)
             return UserOut(id=user_entity.id, message="User updated successfully")
         except sqlalchemy.exc.IntegrityError as e:
             raise HTTPException(status_code=400, detail="Error updating user: " + str(e))
         else:
-            raise HTTPException(status_code=404, detail="User not found")
+             raise HTTPException(status_code=404, detail="User not found")
 
 #显示顾问列表
 @router.get("/user/adviser_list/",tags=["User"])
-async def user_adviser_list(
-    db_session: Session = Depends(get_db_session),
-    phone_number: str = Depends(get_current_user)
-    ):
-
-    user_adviser = db_session.query(AdviserEntity).order_by(asc(AdviserEntity.name)).all()
-    results = []
-    for adviser in user_adviser:
-        adviser_dict = {
-            "name": adviser.name,
-            "bio": adviser.bio
-        }
-        results.append(adviser_dict)
-    return results
+def user_adviser_list(session: SessionDep) -> List:
+    user_adviser = session.query(AdviserEntity).order_by(asc(AdviserEntity.name)).all()
+    results = [{
+        "name": adviser.name,
+        "bio": adviser.bio
+        }for adviser in user_adviser
+        ] 
+    return results 
 
 #显示顾问主页
 @router.get("/user/adviser/home/",tags=["User"])
-async def user_adviser_home(
-    db_session: Session = Depends(get_db_session),
-    phone_number: str = Depends(get_current_user)
-    ):
-    user_adviser = db_session.query(AdviserEntity,AdviserServiceSettings).join(AdviserServiceSettings).all()
-    results = []
-    for adviser_Entity,service_settings in user_adviser:
-        adviser_dict = {
-                "name": adviser_Entity.name,
-                "bio": adviser_Entity.bio,
-                "Text resding": service_settings.amount_adjustment,
-                "About Me": adviser_Entity.about
-                 }
-        results.append(adviser_dict)
+async def user_adviser_home(session: SessionDep) -> List:
+    user_adviser = session.query(AdviserEntity,AdviserServiceSettings).join(AdviserServiceSettings).all()
+    results = [{
+        "name":adviser_Entity.anme,
+        "bio":adviser_Entity.bio,
+        "Text resding": service_settings.amount_adjustment,
+        "About Me": adviser_Entity.about
+        }for adviser_Entity, service_settings in user_adviser
+        ]
     return results
 
 #订单创建#
@@ -113,16 +102,15 @@ async def user_adviser_home(
 async def order_create(
     user_id: int,  
     order_create: UserOrderCreateBase,
-    db_session: Session = Depends(get_db_session),
-    phone_number: str = Depends(get_current_user)
+    session: SessionDep
     ):
-    user = db_session.query(UserEntity).filter(UserEntity.id == user_id).first()
+    user = session.query(UserEntity).filter(UserEntity.id == user_id).first()
 
     if not user:
         raise HTTPException(status_code=404, detail="User not fount")
 
     order_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    delivery = datetime.now() + timedelta(hours=24)
+    delivery = (datetime.now() + timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
 #添加信息
     new_order = UserOrderCreation(
         user_id = user_id,
@@ -131,27 +119,25 @@ async def order_create(
         attach_picture = order_create.attach_picture,
         order_id = generate_number(18),
         order_time = order_time,
-        delivery_time = delivery.strftime('%Y-%m-%d %H:%M:%S'),
+        delivery_time = delivery,
         status = "Pending"
         )
-    if new_order.status == "Pending":
-        user.coin -= 10
+    user.coin -= 10
 
     # 启动异步定时任务
     asyncio.create_task(update_status(order_time))
 
-
-    db_session.add(new_order)
-    db_session.commit()
+    session.add(new_order)
+    session.commit()
 
     return {
-        "name": user.name,
+        "name ": user.name,
         "coin": user.coin,
         "basic information":{
             "name": user.name,
             "birth": user.birth,
             "gender": user.gender
-            },
+            }, 
         "general_situation": order_create.general_situation,
         "specific_question": order_create.specific_question,
         "attach_picture": order_create.attach_picture
@@ -160,10 +146,10 @@ async def order_create(
 #订单列表
 @router.get("/user/order_list",tags=["User"])
 async def order_list(
-    db_session: Session = Depends(get_db_session),
+    session: SessionDep,
     phone_number: str = Depends(get_current_user)
     ):
-    user_list = db_session.query(UserEntity, UserOrderCreation).join(UserOrderCreation).all()
+    user_list = session.query(UserEntity, UserOrderCreation).join(UserOrderCreation).all()
     results = []
     for user_entity, order_creation in user_list:
         user_dict = {
@@ -179,7 +165,7 @@ async def order_list(
 redis_client = redis.StrictRedis(host ='0.0.0.0', port=6379, decode_responses=True)
 @router.get("/user/order_details",tags=["User"])
 async def order_details(
-    db_session: Session = Depends(get_db_session),
+    session: SessionDep,
     phone_number: str = Depends(get_current_user)
     ):
 
@@ -207,7 +193,7 @@ async def order_details(
 async def order_reward(
     adviser_id: str , 
     order_reward: UserOrderRewardBase,
-    db_session: Session = Depends(get_db_session),
+    session: SessionDep,
     phone_number: str = Depends(get_current_user)
     ):
     if not user_reward:
@@ -225,8 +211,8 @@ async def order_reward(
     user_reward.adviser.comments += 1
     user_reward.adviser.complete += 1
 
-    db_session.add(new_reward)
-    db_session.commit()
+    session.add(new_reward)
+    session.commit()
 
     return {
         "Adviser Name":user_reward.adviser.name,
@@ -240,7 +226,7 @@ async def order_reward(
 async def collection_adviser(
     user_id: str,
     collection_data: UserCollectionBase,
-    db_session: Session = Depends(get_db_session),
+    session: SessionDep,
     phone_number: str = Depends(get_current_user)
     ):
 
@@ -251,8 +237,8 @@ async def collection_adviser(
         user_id = collection_data.user_id,
         adviser_id = collection_data.adviser_id,
         )
-    db_session.add(collection)
-    db_session.commit()
+    session.add(collection)
+    session.commit()
 
     return{
         "User Name":user_collection.name,
@@ -265,10 +251,10 @@ async def user_coin_flow(
     user_id: int, 
     coin_change: int, 
     description: str,
-    db_session: Session = Depends(get_db_session),
+    session: SessionDep,
     phone_number: str = Depends(get_current_user)
     ):
-    user = db_session.query(UserEntity).get(user_id)
+    user = session.query(UserEntity).get(user_id)
 
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -287,8 +273,8 @@ async def user_coin_flow(
     if user:
         user.coin = deduction_now
 
-    db_session.add(coin_flow)
-    db_session.commit()
+    session.add(coin_flow)
+    session.commit()
 
     return {
         "Deduction old":user.coin,
@@ -300,23 +286,23 @@ async def user_coin_flow(
 @router.post("/adviser/logon/",tags=["Adviser"], response_model=Adviser_FormOut)
 async def create_adviser(
     adviser: Adviser_FormCreate,
-    db_session: Session = Depends(get_db_session)
+    session: SessionDep
     ):
     adviser_entity = Adviser_FormEntity(
         phone_number = adviser.phone_number, 
         password = adviser.password
         )
-    db_session.add(adviser_entity)
-    db_session.commit()
+    session.add(adviser_entity)
+    session.commit()
     return adviser_entity
 
 #修改信息
 @router.put("/adviser/info/",tags=["Adviser"],response_model=AdviserOut)
 async def update_adviser(
     adviser_id: int, adviser: AdviserBase,
-    db_session: Session = Depends(get_db_session)
+    session: SessionDep
     ):
-    adviser_entity = db_session.query(AdviserEntity).filter(AdviserEntity.id == adviser_id).first()
+    adviser_entity = session.query(AdviserEntity).filter(AdviserEntity.id == adviser_id).first()
     if adviser_entity:
 
         adviser_entity.name = adviser.name
@@ -325,8 +311,8 @@ async def update_adviser(
         adviser_entity.about = adviser.about
 
         try:
-            db_session.commit()
-            db_session.refresh(adviser_entity)
+            session.commit()
+            session.refresh(adviser_entity)
             return AdviserOut(id=adviser_entity.id, message="User updated succ essfull    y")
         except sqlalchemy.exc.IntegrityError as e:
             raise HTTPException(status_code=400, detail="Error updating user: " + str(    e))
@@ -335,23 +321,26 @@ async def update_adviser(
 
 #显示信息
 @router.get("/adviser/home/",tags=["Adviser"])
-async def adviser_home(db_session: Session = Depends(get_db_session)):
+async def adviser_home(
+    session: SessionDep
+    ):
     adviser =  select(AdviserHomeEntity).order_by(asc (AdviserHomeEntity.name))
-    return db_session.execute(adviser).scalars().all()
+    return session.execute(adviser).scalars().all()
 
 #顾问接单状态更新
-@router.put("/adviser/home/",tags=["Adviser"])
+@router.patch("/adviser/home/",tags=["Adviser"])
 async def update_adviser(
-    adviser_id: int, adviser: AdviserOrderBase,
-    db_session: Session = Depends(get_db_session)
+    adviser_id: int,
+    adviser: AdviserOrderBase,
+    session: SessionDep
     ):
-    adviser_entity = db_session.query(AdviserOrderStatus).filter(AdviserOrderStatus.id == adviser_id).first()
+    adviser_entity = session.query(AdviserOrderStatus).filter(AdviserOrderStatus.id == adviser_id).first()
 
     if adviser_entity:
         adviser_entity.order_status = adviser.order_status
         try:
-            db_session.commit()
-            db_session.refresh(adviser_entity)
+            session.commit()
+            session.refresh(adviser_entity)
             return AdviserOut(id=adviser_entity.id, message="User updated successfully")
         except sqlalchemy.exc.IntegrityError as e:
             raise HTTPException(status_code=400, detail="Error updating user: " + str(e))
@@ -362,9 +351,9 @@ async def update_adviser(
 @router.post("/adviser/home/service_settings",tags=["Adviser"])
 async def update_service(
     adviser_id: int,adviser: AdviserServiceBase,
-    db_session: Session = Depends(get_db_session)
+    session: SessionDep
     ):
-    adviser_service = db_session.query(AdviserServiceSettings).filter(AdviserServiceSettings.id == adviser_id).first()
+    adviser_service = session.query(AdviserServiceSettings).filter(AdviserServiceSettings.id == adviser_id).first()
 
     if adviser_service:
         adviser_service.service_adjustment = adviser.service_adjustment
@@ -372,8 +361,8 @@ async def update_service(
             adviser_service.amount_adjustment = adviser.amount_adjustment
 
         try:
-            db_session.commit()
-            db_session.refresh(adviser_service)
+            session.commit()
+            session.refresh(adviser_service)
             return AdviserOut(id=adviser_service.id, message="User updated successfull    y")
         except sqlalchemy.exc.IntegrityError as e:
             raise HTTPException(status_code=400, detail="Error updating user: " + str(    e))
@@ -386,9 +375,9 @@ async def reply_user(
     adviser_id: int, 
     order_id: str, 
     adviser_reply: AdviserReplyBase,
-    db_session: Session = Depends(get_db_session)
+    session: SessionDep
     ):
-    user_order = db_session.query(UserOrderCreation).filter(UserOrderCreation.id == order_id).first()
+    user_order = session.query(UserOrderCreation).filter(UserOrderCreation.id == order_id).first()
 
     if not user_order:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -401,7 +390,7 @@ async def reply_user(
         order_id = order_id,
         reply_text = adviser_reply.reply_text
         )
-    adviser = db_session.query(AdviserHomeEntity).get(adviser_id)
+    adviser = session.query(AdviserHomeEntity).get(adviser_id)
 #这里对顾问回复获得金币未做限制，同一个顾问，同一个订单多次回复，多次增加
     if adviser:
         adviser.coin += 10
@@ -410,8 +399,8 @@ async def reply_user(
         user_order.status = "Completed"
         user_order.delivery_time = reply_time
 
-    db_session.add(new_reply)
-    db_session.commit()
+    session.add(new_reply)
+    session.commit()
 
     return {
         "Adviser Name": adviser.name,
@@ -435,14 +424,16 @@ async def user_coin_flow(
     user_id: int, 
     coin_change: int,
     description: str, 
-    db_session: Session = Depends(get_db_session)
+    session: SessionDep
     ):
-    user = db_session.query(UserEntity).get(user_id)
+    user = session.query(UserEntity).get(user_id)
 
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
     current_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    user.coin += coin_change
 
     coin_flow = UserCoinFlow(
         user_id = user.id,
@@ -451,25 +442,18 @@ async def user_coin_flow(
         timestamp = current_timestamp
         )
 
-    deduction_now = user.coin + coin_flow.coin_change
+    session.add(coin_flow)
+    session.commit()
 
-    if user:
-        user.coin = deduction_now
+    coin_flows = session.query(UserCoinFlow).all()
 
-    db_session.add(coin_flow)
-    db_session.commit()
-
-    coin_flows = db_session.query(UserCoinFlow).all()
-
-    coin_flow = []
-    for flow in coin_flows:
-        flow_data = {
-            "id": flow.id,
-            "user_id": flow.user_id,
-            "coin_change": flow.coin_change,
-            "description": flow.description,
-            "timestamp": flow.timestamp.strftime('%Y-%m-%d %H:%M:%S')
-        }
-        coin_flow.append(flow_data)
+    coin_flow = [{
+        "id": flow.id,
+        "user_id": flow.user_id,
+        "coin_change": flow.coin_change,
+        "description": flow.description,
+        "timestamp": flow.timestamp.strftime('%Y-%m-%d %H:%M:%S')
+        }for flow in coin_flows
+        ]
 
     return {"coin_flows": coin_flows}
